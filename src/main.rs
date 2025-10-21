@@ -227,7 +227,7 @@ fn handle_vtable(
 
         let in_typeinfo = cxxabi_offsets
             .iter()
-            .find(|offset| **offset == next_u32)
+            .find(|offset| **offset == addr)
             .is_some();
         let in_offset_to_this = next_u32 == class_typeinfo;
 
@@ -246,7 +246,7 @@ fn handle_vtable(
 fn get_class_vtable(
     reader: &mut BinReader,
     vtable_addr: u32,
-    cxxabi_offsets: Vec<u32>,
+    cxxabi_offsets: &Vec<u32>,
 ) -> Vec<(i32, Vec<u32>)> {
     let mut result: Vec<(i32, Vec<u32>)> = Vec::new();
 
@@ -276,13 +276,14 @@ fn get_class_vtable(
 fn main() {
     let cmd = clap::Command::new("reimu")
         .subcommand(
-            clap::command!("class_info")
+            clap::command!("class-info")
                 .group(
                     clap::ArgGroup::new("actions")
-                        .args(["dump-vtable-ida", "dump-vtable-json", "inheritance"])
+                        .args(["create-vtable-ida", "create-vtable-cpp", "dump-vtable-json", "inheritance"])
                         .required(true),
                 )
-                .arg(clap::arg!(--"dump-vtable-ida"))
+                .arg(clap::arg!(--"create-vtable-ida"))
+                .arg(clap::arg!(--"create-vtable-cpp"))
                 .arg(clap::arg!(--"inheritance"))
                 .arg(clap::arg!(--"dump-vtable-json"))
                 .arg(
@@ -315,7 +316,7 @@ fn main() {
                 serde_json::to_string_pretty(&dump_symbols(&game_bin)).unwrap()
             );
         }
-        Some(("class_info", matches)) => {
+        Some(("class-info", matches)) => {
             let game_bin_path = matches
                 .get_one::<std::path::PathBuf>("library-path")
                 .unwrap();
@@ -357,7 +358,7 @@ fn main() {
 
                     println!("{}", inherit_info.get_display());
                 }
-                "dump-vtable-ida" | "dump-vtable-json" => {
+                "create-vtable-ida" | "create-vtable-cpp" | "dump-vtable-json" => {
                     #[derive(Serialize)]
                     struct DumpVtableJSONOutput {
                         name: String,
@@ -369,7 +370,7 @@ fn main() {
                     let vtable_addr = sym_to_addr
                         .get(&vtable_symbol)
                         .expect(format!("unknown symbol for vtable: {:?}", vtable_symbol).as_str());
-                    let dump = get_class_vtable(&mut reader, *vtable_addr, cxxabi_offsets);
+                    let dump = get_class_vtable(&mut reader, *vtable_addr, &cxxabi_offsets);
 
                     if action == "dump-vtable-json" {
                         let mut entry: Vec<DumpVtableJSONOutput> = Vec::new();
@@ -383,7 +384,83 @@ fn main() {
                             i += 1;
                         });
                         println!("{}", serde_json::to_string_pretty(&entry).unwrap());
-                    } else {
+                    } else if action == "create-vtable-cpp" {
+                        let mut inherit_info = Class::default();
+                        let vtable_symbol = get_vtable_mangled_name(class_name);
+                        let vtable_addr = sym_to_addr.get(&vtable_symbol).expect(
+                            format!("unknown symbol for vtable: {:?}", vtable_symbol).as_str(),
+                        );
+
+                        reader.set_position(vtable_addr + 4);
+                        let typeinfo_addr = reader.read_u32().unwrap();
+                        reader.set_position(*vtable_addr);
+
+                        handle_typename(
+                            &mut reader,
+                            &mut inherit_info,
+                            typeinfo_addr,
+                            get_section_range(&game_bin, &".data.rel.ro".to_string())
+                                .unwrap()
+                                .0 as u32,
+                            &cxxabi_offsets,
+                        );
+
+                        println!(
+                            "NOTE: The return type for these functions cannot be determined and are defined as `void`"
+                        );
+
+                        if inherit_info.base.len() > 0 {
+                            let base = inherit_info
+                                .base
+                                .iter()
+                                .map(|class| {
+                                    let demangled = cpp_demangle::Symbol::new(&class.name)
+                                        .expect("failed to parse symbol")
+                                        .demangle()
+                                        .expect("failed to demangle symbol");
+                                    format!("public {}", demangled)
+                                })
+                                .collect::<Vec<String>>()
+                                .join(", ");
+                            println!("class {} : {} {{", class_name, base);
+                        } else {
+                            println!("class {} {{", class_name);
+                        }
+
+                        println!("public:");
+
+                        let mut declarations: Vec<String> = Vec::new();
+                        let mut declare_virtual_dtor = false;
+
+                        for addr in &dump[0].1 {
+                            let symbol = addr_to_sym[&addr].to_owned();
+                            let demangled = cpp_demangle::Symbol::new(&symbol)
+                                .expect("failed to parse symbol")
+                                .demangle()
+                                .expect("failed to demangle symbol");
+
+                            if symbol.ends_with("D0Ev") || symbol.ends_with("D1Ev") {
+                                declare_virtual_dtor = true;
+                            } else if demangled.starts_with(class_name) {
+                                declarations
+                                    .push(format!("void {}", &demangled[class_name.len() + 2..]));
+                            }
+                        }
+
+                        if declare_virtual_dtor {
+                            if let Some(ns_end) = class_name.rfind("::") {
+                                println!("    virtual ~{}();", &class_name[ns_end + 2..]);
+                            } else {
+                                println!("    virtual ~{}();", &class_name);
+                            }
+                        }
+
+                        for declaration in declarations {
+                            println!("    virtual {};", declaration);
+                        }
+
+                        println!("}};");
+                    } else if action == "create-vtable-ida" {
                         let mut main_class_fields: Vec<String> = Vec::new();
                         let mut last_offset_to_this = 0;
                         let mut filler_counter = 0;

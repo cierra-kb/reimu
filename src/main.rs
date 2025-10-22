@@ -48,23 +48,44 @@ impl Class {
     }
 }
 
-fn get_section_range(data: &Vec<u8>, search_name: &String) -> Option<(u64, u64)> {
+fn get_section_by_name<S: AsRef<str>>(
+    data: &Vec<u8>,
+    section_name: S,
+) -> Option<elf::section::SectionHeader> {
     let elf = elf::ElfBytes::<elf::endian::LittleEndian>::minimal_parse(data).unwrap();
     let (shdrs_r, strtab_r) = elf.section_headers_with_strtab().unwrap();
     let (shdrs, strtab) = (shdrs_r.unwrap(), strtab_r.unwrap());
 
-    while let Some(header) = shdrs
+    if let Some(header) = shdrs
         .into_iter()
         .filter(|header| match strtab.get(header.sh_name as usize) {
-            Ok(header_name) => header_name == search_name,
+            Ok(header_name) => header_name == section_name.as_ref(),
             Err(_) => false,
         })
         .next()
     {
-        return Some((header.sh_offset, header.sh_offset + header.sh_size));
+        Some(header)
+    } else {
+        None
     }
+}
 
-    None
+fn get_section_range(data: &Vec<u8>, section_name: &String) -> Option<(u64, u64)> {
+    if let Some(header) = get_section_by_name(data, section_name) {
+        Some((header.sh_offset, header.sh_offset + header.sh_size))
+    } else {
+        None
+    }
+}
+
+fn get_file_offset_for_address_under_section<S: AsRef<str>>(
+    data: &Vec<u8>,
+    section_name: S,
+    addr: u64,
+) -> u64 {
+    let section = get_section_by_name(data, section_name).unwrap();
+    let relative_address = addr - section.sh_addr;
+    section.sh_offset + relative_address
 }
 
 fn dump_symbols(data: &Vec<u8>) -> (HashMap<String, u32>, HashMap<u32, String>) {
@@ -116,7 +137,14 @@ fn handle_typename(
 ) {
     reader.set_position(offset + 4);
 
-    let name = reader.read_cstr().expect("failed to read type name");
+    let reader_data = reader.get_data();
+    let name = reader
+        .read_cstr(Some(|address: u32| {
+            return get_file_offset_for_address_under_section(reader_data, ".rodata", address.into())
+                as u32;
+        }))
+        .expect("failed to read type name")
+        .to_string();
     let second_field = reader
         .read_u32()
         .expect("failed to read dword after type name");
@@ -143,7 +171,13 @@ fn handle_typename(
         handle_typename(
             reader,
             output.push_base(),
-            second_field,
+            get_file_offset_for_address_under_section(
+                reader.get_data(),
+                ".data.rel.ro",
+                second_field.into(),
+            )
+            .try_into()
+            .unwrap(),
             start_data_rel_ro,
             rtti_class_offsets,
         );
@@ -178,9 +212,14 @@ fn handle_typename(
             let base_class_count = third_field;
 
             for _ in 0..base_class_count {
-                let type_descriptor = reader
+                let type_descriptor_address = reader
                     .read_u32()
-                    .expect("failed to read offset to base class typeinfo");
+                    .expect("failed to read address to base class typeinfo");
+                let type_descriptor_offset = get_file_offset_for_address_under_section(
+                    reader.get_data(),
+                    ".data.rel.ro",
+                    type_descriptor_address.into(),
+                );
                 let _base_attribute = reader
                     .read_u32()
                     .expect("failed to read attribute of base class");
@@ -188,7 +227,7 @@ fn handle_typename(
                 handle_typename(
                     reader,
                     output.push_base(),
-                    type_descriptor,
+                    type_descriptor_offset.try_into().unwrap(),
                     start_data_rel_ro,
                     rtti_class_offsets,
                 );
@@ -341,15 +380,24 @@ fn main() {
                     let vtable_addr = sym_to_addr
                         .get(&vtable_symbol)
                         .expect(format!("unknown symbol for vtable: {:?}", vtable_symbol).as_str());
+                    let vtable_offset = get_file_offset_for_address_under_section(
+                        &game_bin,
+                        ".data.rel.ro",
+                        (*vtable_addr).into(),
+                    ) as u32;
 
-                    reader.set_position(vtable_addr + 4);
-                    let typeinfo_addr = reader.read_u32().unwrap();
-                    reader.set_position(*vtable_addr);
+                    reader.set_position(vtable_offset + 4);
+                    let typeinfo_offset = get_file_offset_for_address_under_section(
+                        &game_bin,
+                        ".data.rel.ro",
+                        reader.read_u32().unwrap() as u64,
+                    );
+                    reader.set_position(vtable_offset);
 
                     handle_typename(
                         &mut reader,
                         &mut inherit_info,
-                        typeinfo_addr,
+                        typeinfo_offset as u32,
                         get_section_range(&game_bin, &".data.rel.ro".to_string())
                             .unwrap()
                             .0 as u32,
@@ -367,10 +415,19 @@ fn main() {
                     }
 
                     let vtable_symbol = get_vtable_mangled_name(class_name);
-                    let vtable_addr = sym_to_addr
-                        .get(&vtable_symbol)
-                        .expect(format!("unknown symbol for vtable: {:?}", vtable_symbol).as_str());
-                    let dump = get_class_vtable(&mut reader, *vtable_addr, &cxxabi_offsets);
+                    let vtable_offset = get_file_offset_for_address_under_section(
+                        reader.get_data(),
+                        ".data.rel.ro",
+                        (*sym_to_addr.get(&vtable_symbol).expect(
+                            format!("unknown symbol for vtable: {:?}", vtable_symbol).as_str(),
+                        ))
+                        .into(),
+                    ) as u32;
+                    let dump = get_class_vtable(
+                        &mut reader,
+                        vtable_offset.try_into().unwrap(),
+                        &cxxabi_offsets,
+                    );
 
                     if action == "dump-vtable-json" {
                         let mut entry: Vec<DumpVtableJSONOutput> = Vec::new();
@@ -386,14 +443,14 @@ fn main() {
                         println!("{}", serde_json::to_string_pretty(&entry).unwrap());
                     } else if action == "create-vtable-cpp" {
                         let mut inherit_info = Class::default();
-                        let vtable_symbol = get_vtable_mangled_name(class_name);
-                        let vtable_addr = sym_to_addr.get(&vtable_symbol).expect(
-                            format!("unknown symbol for vtable: {:?}", vtable_symbol).as_str(),
-                        );
 
-                        reader.set_position(vtable_addr + 4);
-                        let typeinfo_addr = reader.read_u32().unwrap();
-                        reader.set_position(*vtable_addr);
+                        reader.set_position(vtable_offset + 4);
+                        let typeinfo_addr = get_file_offset_for_address_under_section(
+                            reader.get_data(),
+                            ".data.rel.ro",
+                            reader.read_u32().unwrap().into(),
+                        ) as u32;
+                        reader.set_position(vtable_offset);
 
                         handle_typename(
                             &mut reader,

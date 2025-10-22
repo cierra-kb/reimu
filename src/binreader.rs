@@ -1,13 +1,15 @@
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek};
 
 pub struct BinReader<'a> {
     cursor: Cursor<&'a Vec<u8>>,
+    data: &'a Vec<u8>,
 }
 
 impl<'a> BinReader<'a> {
     pub fn new(data: &'a Vec<u8>) -> Self {
         Self {
             cursor: Cursor::new(data),
+            data,
         }
     }
 
@@ -66,16 +68,21 @@ impl<'a> BinReader<'a> {
         }
     }
 
-    pub fn read_cstr(&mut self) -> Option<String> {
+    pub fn read_cstr(&mut self, adjust: Option<impl Fn(u32) -> u32>) -> Option<String> {
         let mut buffer: Vec<u8> = vec![];
 
         let return_offset = self.get_position() + 4;
 
-        let offset_to_string = match self.read_u32() {
+        let mut position_to_string = match self.read_u32() {
             Some(offset) => offset,
             None => return None,
         };
-        self.set_position(offset_to_string);
+
+        if let Some(adjust_fn) = adjust {
+            position_to_string = adjust_fn(position_to_string);
+        }
+
+        self.set_position(position_to_string);
 
         while let Some(byte) = self.read_u8() {
             if byte == 0 {
@@ -90,5 +97,9 @@ impl<'a> BinReader<'a> {
             Ok(str) => Some(str),
             Err(_) => None,
         }
+    }
+
+    pub fn get_data(&self) -> &'a Vec<u8> {
+        self.data
     }
 }
